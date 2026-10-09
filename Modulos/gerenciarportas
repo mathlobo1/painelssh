@@ -1,0 +1,153 @@
+#!/bin/bash
+# Gerenciador de portas do PAINEL FFHTB2
+# As operações usam ss/fuser para funcionar em sistemas atuais.
+
+PORT_MANAGER_SCRIPT="${PORT_MANAGER_SCRIPT:-/etc/SSHPlus/gerenciarportas}"
+PORT_PROXY_DIR="${PORT_PROXY_DIR:-/etc/SSHPlus}"
+
+port_is_valid() {
+    [[ "$1" =~ ^[0-9]+$ ]] && (( 1 <= 10#$1 && 10#$1 <= 65535 ))
+}
+
+port_list() {
+    echo -e "\033[1;36mPORTAS TCP/UDP EM ESCUTA\033[0m"
+    echo -e "\033[1;34mPROTO\tENDERECO\tPROCESSO\tPID\033[0m"
+    if ! command -v ss >/dev/null 2>&1; then
+        echo "O comando ss não está instalado. Instale iproute2."
+        return 1
+    fi
+    local found=0 line proto local_addr process pid
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        found=1
+        proto=$(awk '{print $1}' <<<"$line")
+        local_addr=$(awk '{print $5}' <<<"$line")
+        process=$(sed -n 's/.*users:(("\([^"]*\)".*/\1/p' <<<"$line")
+        pid=$(sed -n 's/.*pid=\([0-9]*\).*/\1/p' <<<"$line")
+        printf '%s\t%s\t%s\t%s\n' "$proto" "$local_addr" "${process:--}" "${pid:--}"
+    done < <(ss -H -ltnup 2>/dev/null)
+    (( found == 0 )) && echo "Nenhuma porta em escuta foi encontrada."
+}
+
+port_details() {
+    local port="$1"
+    ss -H -ltnup "( sport = :$port )" 2>/dev/null || true
+}
+
+port_in_use() {
+    local port="$1"
+    ss -H -ltnup "( sport = :$port )" 2>/dev/null | grep -q .
+}
+
+ssh_ports() {
+    awk '$1 == "Port" {print $2}' /etc/ssh/sshd_config 2>/dev/null
+    ss -H -ltnp 2>/dev/null | awk '$1 == "tcp" && $NF ~ /sshd/ {n=$5; sub(/^.*:/,"",n); print n}'
+}
+
+remove_autostart_for_port() {
+    local port="$1"
+    [[ -f /etc/autostart ]] && sed -i -E "/(proxy\.py|open\.py).*${port}/d" /etc/autostart
+}
+
+stop_port() {
+    local port="$1"
+    if ! port_is_valid "$port"; then
+        echo "Porta inválida: $port"
+        return 1
+    fi
+    if ! port_in_use "$port"; then
+        echo "A porta $port não está em uso."
+        return 0
+    fi
+    local protected
+    protected=$(ssh_ports | sort -nu | tr '\n' ' ')
+    if grep -qw "$port" <<<"$protected"; then
+        echo "A porta $port é uma porta SSH protegida e não será parada."
+        return 1
+    fi
+    echo "Processos encontrados na porta $port:"
+    port_details "$port"
+    read -r -p "Parar os processos dessa porta? [s/N]: " confirm
+    [[ "$confirm" =~ ^[sS]$ ]] || { echo "Operação cancelada."; return 0; }
+    fuser -k -TERM "$port"/tcp "$port"/udp >/dev/null 2>&1 || true
+    sleep 1
+    fuser -k -KILL "$port"/tcp "$port"/udp >/dev/null 2>&1 || true
+    remove_autostart_for_port "$port"
+    if port_in_use "$port"; then
+        echo "A porta $port ainda está em uso. Verifique o serviço responsável."
+        return 1
+    fi
+    echo "Porta $port parada com sucesso."
+}
+
+stop_all_ports() {
+    local protected ports port
+    protected=$(ssh_ports | sort -nu | tr '\n' ' ')
+    ports=$(ss -H -ltnup 2>/dev/null | awk '{n=$5; sub(/^.*:/,"",n); print n}' | sort -nu)
+    echo "Portas SSH protegidas: ${protected:-nenhuma}"
+    echo "Portas que serão encerradas:"
+    for port in $ports; do
+        grep -qw "$port" <<<"$protected" || echo "  - $port"
+    done
+    read -r -p "Parar todas as demais portas? [s/N]: " confirm
+    [[ "$confirm" =~ ^[sS]$ ]] || { echo "Operação cancelada."; return 0; }
+    for port in $ports; do
+        grep -qw "$port" <<<"$protected" && continue
+        fuser -k -TERM "$port"/tcp "$port"/udp >/dev/null 2>&1 || true
+        remove_autostart_for_port "$port"
+    done
+    sleep 2
+    echo "Portas não protegidas encerradas."
+    port_list
+}
+
+activate_proxy_port() {
+    local port="$1" kind="$2" target
+    [[ "$kind" == "openvpn" ]] && target="$PORT_PROXY_DIR/open.py" || target="$PORT_PROXY_DIR/proxy.py"
+    if ! port_is_valid "$port"; then echo "Porta inválida: $port"; return 1; fi
+    if port_in_use "$port"; then echo "A porta $port já está em uso:"; port_details "$port"; return 1; fi
+    [[ -f "$target" ]] || { echo "Script não encontrado: $target"; return 1; }
+    command -v python3 >/dev/null 2>&1 || { echo "python3 não está instalado."; return 1; }
+    screen -S "${kind}_proxy" -X quit >/dev/null 2>&1 || true
+    screen -dmS "${kind}_proxy" python3 "$target" "$port"
+    sleep 1
+    if port_in_use "$port"; then
+        grep -vE "(proxy\.py|open\.py).*${port}" /etc/autostart 2>/dev/null > /tmp/autostart.$$ || true
+        echo "netstat -tlpn | grep -w $port >/dev/null || { screen -S '${kind}_proxy' -X quit; screen -dmS '${kind}_proxy' python3 '$target' '$port'; }" >> /tmp/autostart.$$
+        [[ -f /etc/autostart ]] && mv /tmp/autostart.$$ /etc/autostart || rm -f /tmp/autostart.$$
+        echo "Proxy ${kind} ativado na porta $port."
+        port_details "$port"
+    else
+        echo "Falha ao iniciar o proxy ${kind}. Consulte: screen -S ${kind}_proxy -X hardcopy /tmp/${kind}_proxy.log"
+        return 1
+    fi
+}
+
+port_menu() {
+    while true; do
+        clear
+        echo -e "\033[1;44;37m          GERENCIAR PORTAS          \033[0m"
+        port_list
+        echo
+        echo "[1] Listar todas as portas em uso"
+        echo "[2] Ativar proxy SOCKS em uma porta"
+        echo "[3] Ativar proxy OpenVPN em uma porta"
+        echo "[4] Parar uma porta"
+        echo "[5] Parar todas as portas (mantém SSH)"
+        echo "[0] Voltar"
+        read -r -p "Escolha uma opção: " op
+        case "$op" in
+            1) read -r -p "Enter para continuar..."; ;;
+            2|3)
+                read -r -p "Informe a porta: " port
+                [[ "$op" == 2 ]] && activate_proxy_port "$port" socks || activate_proxy_port "$port" openvpn
+                read -r -p "Enter para continuar..." ;;
+            4) read -r -p "Informe a porta: " port; stop_port "$port"; read -r -p "Enter para continuar..." ;;
+            5) stop_all_ports; read -r -p "Enter para continuar..." ;;
+            0) return 0 ;;
+            *) echo "Opção inválida."; sleep 1 ;;
+        esac
+    done
+}
+
+port_menu
